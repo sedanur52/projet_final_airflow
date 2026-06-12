@@ -1,7 +1,11 @@
 from datetime import date, datetime
 from typing import Any
 
-from fx_pipeline.config import FX_FRESHNESS_THRESHOLD_DAYS
+from fx_pipeline.config import (
+    FX_FRESHNESS_THRESHOLD_DAYS,
+    FX_FORCE_INVALID_CODE_FOR,
+    FX_FORCE_INVALID_RATE_FOR,
+)
 
 
 def evaluate_fx_quality(transformed_payload: dict[str, Any]) -> dict[str, Any]:
@@ -32,14 +36,32 @@ def evaluate_fx_quality(transformed_payload: dict[str, Any]) -> dict[str, Any]:
 
     for row in rows:
         rejection_reason = None
+        row_to_check = row.copy()
 
-        if not row["base_currency"] or not row["quote_currency"]:
+        # Etape de simulation d'un taux invalide pour les tests de qualite.
+        if (
+            FX_FORCE_INVALID_RATE_FOR
+            and row_to_check["quote_currency"] == FX_FORCE_INVALID_RATE_FOR
+        ):
+            row_to_check["exchange_rate"] = 0
+
+        # Etape de simulation d'un code devise invalide pour les tests de qualite.
+        if (
+            FX_FORCE_INVALID_CODE_FOR
+            and row_to_check["quote_currency"] == FX_FORCE_INVALID_CODE_FOR
+        ):
+            row_to_check["quote_currency"] = "XX"
+
+        if not row_to_check["base_currency"] or not row_to_check["quote_currency"]:
             rejection_reason = "Structure invalide sur les codes devises"
-        elif row["exchange_rate"] is None:
+        elif row_to_check["exchange_rate"] is None:
             rejection_reason = "Taux manquant"
-        elif float(row["exchange_rate"]) <= 0:
+        elif float(row_to_check["exchange_rate"]) <= 0:
             rejection_reason = "Taux negatif ou nul"
-        elif len(row["base_currency"]) != 3 or len(row["quote_currency"]) != 3:
+        elif (
+            len(row_to_check["base_currency"]) != 3
+            or len(row_to_check["quote_currency"]) != 3
+        ):
             rejection_reason = "Code devise invalide"
         elif freshness_gap > FX_FRESHNESS_THRESHOLD_DAYS:
             rejection_reason = "Donnee trop ancienne selon le seuil de fraicheur"
@@ -47,17 +69,19 @@ def evaluate_fx_quality(transformed_payload: dict[str, Any]) -> dict[str, Any]:
         if rejection_reason:
             rows_rejected.append(
                 {
-                    "run_id": row["run_id"],
-                    "rate_date": row["rate_date"],
-                    "base_currency": row["base_currency"],
-                    "quote_currency": row["quote_currency"],
-                    "currency_pair": row["currency_pair"],
-                    "raw_rate": str(row["exchange_rate"]),
+                    "run_id": row_to_check["run_id"],
+                    "rate_date": row_to_check["rate_date"],
+                    "base_currency": row_to_check["base_currency"],
+                    "quote_currency": row_to_check["quote_currency"],
+                    "currency_pair": (
+                        f"{row_to_check['base_currency']}/{row_to_check['quote_currency']}"
+                    ),
+                    "raw_rate": str(row_to_check["exchange_rate"]),
                     "rejection_reason": rejection_reason,
                 }
             )
         else:
-            rows_valid.append(row)
+            rows_valid.append(row_to_check)
 
     return {
         "run_id": transformed_payload["run_id"],

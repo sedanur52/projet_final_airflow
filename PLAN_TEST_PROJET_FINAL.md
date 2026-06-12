@@ -167,15 +167,29 @@ FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD,XXX
 
 Cela permet de provoquer un rejet pour devise manquante ou structure invalide.
 
-#### Option 3 - Simulation explicite a ajouter si besoin
+#### Option 3 - Simulation explicite d'un taux invalide
 
-Si le cas est difficile a provoquer naturellement, vous pouvez ajouter une variable de simulation dediee au pipeline, par exemple :
+Modifier temporairement dans `.env` :
 
 ```env
-FX_FORCE_REJECTION_CURRENCY=USD
+FX_FORCE_INVALID_RATE_FOR=USD
 ```
 
-Puis dans le code qualite, forcer le rejet de cette devise pour le test.
+Effet attendu :
+- la devise `USD` est transformee avec un taux `0` pour le test ;
+- la ligne est rejetee avec le motif `Taux negatif ou nul`.
+
+#### Option 4 - Simulation explicite d'un code devise invalide
+
+Modifier temporairement dans `.env` :
+
+```env
+FX_FORCE_INVALID_CODE_FOR=USD
+```
+
+Effet attendu :
+- la devise `USD` est transformee avec un code invalide `XX` pour le test ;
+- la ligne est rejetee avec le motif `Code devise invalide`.
 
 ### Action
 
@@ -381,7 +395,99 @@ Ou lecture via interface Airflow sur chaque tache.
 - une capture du dossier de logs ou de l'onglet `Logs`
 - plusieurs captures montrant des messages applicatifs utiles
 
-## Cas 6 - KPIs Metabase
+## Cas 6 - Detail des tests de qualite
+
+### But
+
+Prouver explicitement les dimensions qualite demandees par le sujet :
+- completude ;
+- structure ;
+- coherence ;
+- fraicheur ;
+- unicite.
+
+### Test 6.1 - Completude
+
+Modifier temporairement `.env` :
+
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD,XXX
+```
+
+Resultat attendu :
+- au moins une ligne dans `fx_rejections` ;
+- motif `Devise cible manquante dans la reponse API` ;
+- run journalise comme execution avec rejets.
+
+### Test 6.2 - Structure
+
+Modifier temporairement `.env` :
+
+```env
+FX_FORCE_INVALID_CODE_FOR=USD
+```
+
+Resultat attendu :
+- au moins une ligne dans `fx_rejections` ;
+- motif `Code devise invalide`.
+
+### Test 6.3 - Coherence
+
+Modifier temporairement `.env` :
+
+```env
+FX_FORCE_INVALID_RATE_FOR=USD
+```
+
+Resultat attendu :
+- au moins une ligne dans `fx_rejections` ;
+- motif `Taux negatif ou nul`.
+
+### Test 6.4 - Fraicheur
+
+Modifier temporairement `.env` :
+
+```env
+FX_FRESHNESS_THRESHOLD_DAYS=-1
+```
+
+Resultat attendu :
+- toutes ou presque toutes les lignes vont en rejet ;
+- motif `Donnee trop ancienne selon le seuil de fraicheur`.
+
+### Test 6.5 - Unicite
+
+Garder la configuration nominale puis relancer le DAG deux fois.
+
+Resultat attendu :
+- aucune ligne retournee par la requete anti-doublon ;
+- pas de duplication logique dans `fx_rates`.
+
+### Requete de synthese des motifs de rejet
+
+```powershell
+docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT rejection_reason, COUNT(*) FROM fx_rejections GROUP BY rejection_reason ORDER BY COUNT(*) DESC;"
+```
+
+### Retour a l'etat nominal
+
+Remettre ensuite dans `.env` :
+
+```env
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+```
+
+Puis relancer :
+
+```powershell
+docker compose down
+docker compose up -d
+```
+
+## Cas 7 - KPIs Metabase
 
 ### But
 
@@ -402,10 +508,11 @@ Prouver que les donnees chargees sont exploitables.
 1. verifier `\dt`
 2. tester le cas nominal
 3. tester l'idempotence
-4. tester le chemin d'echec
-5. tester les alertes
-6. recuperer les logs
-7. recuperer les captures Metabase
+4. tester les controles qualite un par un
+5. tester le chemin d'echec
+6. tester les alertes
+7. recuperer les logs
+8. recuperer les captures Metabase
 
 ## Resultat final attendu
 
