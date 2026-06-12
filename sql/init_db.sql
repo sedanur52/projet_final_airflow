@@ -74,8 +74,10 @@ CREATE TABLE IF NOT EXISTS fx_run_logs (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE OR REPLACE VIEW vw_fx_latest_rates AS
+DROP VIEW IF EXISTS vw_fx_latest_rates CASCADE;
+CREATE VIEW vw_fx_latest_rates AS
 SELECT DISTINCT ON (currency_pair)
+    run_id,
     rate_date,
     base_currency,
     quote_currency,
@@ -85,30 +87,36 @@ SELECT DISTINCT ON (currency_pair)
 FROM fx_rates
 ORDER BY currency_pair, rate_date DESC, ingested_at DESC;
 
-CREATE OR REPLACE VIEW vw_fx_alerts_summary AS
+DROP VIEW IF EXISTS vw_fx_alerts_summary CASCADE;
+CREATE VIEW vw_fx_alerts_summary AS
 SELECT
     rate_date,
     currency_pair,
+    ROUND(MAX(threshold_used) * 100, 4) AS threshold_used_pct,
     COUNT(*) AS alert_count,
-    MAX(rate_delta) AS max_rate_delta
+    ROUND(MAX(rate_delta) * 100, 4) AS max_rate_delta_pct
 FROM fx_alerts
 GROUP BY rate_date, currency_pair
 ORDER BY rate_date DESC, currency_pair;
 
-CREATE OR REPLACE VIEW vw_fx_run_quality_summary AS
+DROP VIEW IF EXISTS vw_fx_run_quality_summary CASCADE;
+CREATE VIEW vw_fx_run_quality_summary AS
 SELECT
     created_at,
     run_id,
+    pipeline_name,
     status,
     rows_received,
     rows_valid,
     rows_rejected,
     rows_inserted,
-    alert_count
+    alert_count,
+    message
 FROM fx_run_logs
 ORDER BY created_at DESC;
 
-CREATE OR REPLACE VIEW vw_fx_rate_variation_pct AS
+DROP VIEW IF EXISTS vw_fx_rate_variation_pct CASCADE;
+CREATE VIEW vw_fx_rate_variation_pct AS
 WITH ranked_rates AS (
     SELECT
         rate_date,
@@ -132,7 +140,8 @@ SELECT
 FROM ranked_rates
 ORDER BY rate_date, currency_pair;
 
-CREATE OR REPLACE VIEW vw_fx_alert_count_by_currency AS
+DROP VIEW IF EXISTS vw_fx_alert_count_by_currency CASCADE;
+CREATE VIEW vw_fx_alert_count_by_currency AS
 SELECT
     SPLIT_PART(currency_pair, '/', 2) AS quote_currency,
     COUNT(*) AS alert_count
@@ -140,20 +149,65 @@ FROM fx_alerts
 GROUP BY SPLIT_PART(currency_pair, '/', 2)
 ORDER BY alert_count DESC, quote_currency;
 
-CREATE OR REPLACE VIEW vw_fx_alert_avg_intensity AS
+DROP VIEW IF EXISTS vw_fx_alert_avg_intensity CASCADE;
+CREATE VIEW vw_fx_alert_avg_intensity AS
 SELECT
     ROUND(AVG(rate_delta) * 100, 4) AS avg_alert_intensity_pct
 FROM fx_alerts;
 
-CREATE OR REPLACE VIEW vw_fx_latest_alerts AS
+DROP VIEW IF EXISTS vw_fx_latest_alerts CASCADE;
+CREATE VIEW vw_fx_latest_alerts AS
 SELECT
+    id,
     alert_created_at,
     run_id,
     rate_date,
     currency_pair,
+    SPLIT_PART(currency_pair, '/', 1) AS base_currency,
+    SPLIT_PART(currency_pair, '/', 2) AS quote_currency,
     previous_rate,
     current_rate,
     ROUND(rate_delta * 100, 4) AS rate_delta_pct,
     ROUND(threshold_used * 100, 4) AS threshold_used_pct
 FROM fx_alerts
 ORDER BY alert_created_at DESC;
+
+DROP VIEW IF EXISTS vw_fx_rejections_by_reason CASCADE;
+CREATE VIEW vw_fx_rejections_by_reason AS
+SELECT
+    rejection_reason,
+    COUNT(*) AS rejection_count
+FROM fx_rejections
+GROUP BY rejection_reason
+ORDER BY rejection_count DESC, rejection_reason;
+
+DROP VIEW IF EXISTS vw_fx_latest_rejections CASCADE;
+CREATE VIEW vw_fx_latest_rejections AS
+SELECT
+    rejected_at,
+    run_id,
+    rate_date,
+    base_currency,
+    quote_currency,
+    currency_pair,
+    raw_rate,
+    rejection_reason
+FROM fx_rejections
+ORDER BY rejected_at DESC;
+
+DROP VIEW IF EXISTS vw_fx_run_status_counts CASCADE;
+CREATE VIEW vw_fx_run_status_counts AS
+SELECT
+    status,
+    COUNT(*) AS run_count
+FROM fx_run_logs
+GROUP BY status
+ORDER BY run_count DESC, status;
+
+DROP VIEW IF EXISTS vw_fx_run_totals CASCADE;
+CREATE VIEW vw_fx_run_totals AS
+SELECT
+    COUNT(*) AS total_runs,
+    COUNT(*) FILTER (WHERE status = 'success') AS success_runs,
+    COUNT(*) FILTER (WHERE status = 'quality_rejections_logged') AS failed_quality_runs
+FROM fx_run_logs;

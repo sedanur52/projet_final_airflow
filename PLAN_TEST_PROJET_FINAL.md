@@ -2,33 +2,31 @@
 
 ## Objectif
 
-Ce document sert a :
-- verifier le bon fonctionnement du pipeline ;
-- produire les captures demandees dans le sujet ;
-- structurer les tests avant le rendu final.
-
-## Rappel des livrables a prouver
-
-Le sujet demande au minimum :
-- le DAG Python complet et fonctionnel ;
-- le fichier `init_db.sql` ;
-- une capture de l'UI Airflow avec execution reussie ;
-- des captures des tables PostgreSQL apres execution ;
-- une capture de la table de logs ;
-- une capture de la table d'alertes avec justification du seuil ;
-- des captures des KPIs sur Metabase ;
-- une note expliquant la robustesse et les controles qualite.
+Ce plan de test couvre uniquement les elements essentiels demandes dans le sujet :
+- extraction depuis l'API ;
+- stockage brut ;
+- transformation et chargement ;
+- chemin nominal et chemin d'echec ;
+- controle qualite sur les dimensions minimales ;
+- tracabilite des rejets ;
+- idempotence.
 
 ## Prerequis
 
 - Docker Desktop demarre
-- conteneurs `airflow` et `postgres` lances
+- services `airflow` et `postgres` lances
 - Airflow accessible sur `http://localhost:8080`
-- utilisateur Airflow cree
-- PostgreSQL initialise avec `sql/init_db.sql`
+- base PostgreSQL initialisee avec `sql/init_db.sql`
 - DAG `fx_rates_pipeline` visible dans Airflow
 
-## Commandes de base
+## Tables a verifier
+
+- `fx_raw_ingestion`
+- `fx_rates`
+- `fx_rejections`
+- `fx_run_logs`
+
+## Commandes utiles
 
 Depuis `airflow/Projet Final airflow` :
 
@@ -38,488 +36,218 @@ Lancer les services :
 docker compose up -d
 ```
 
-Verifier l'etat des conteneurs :
-
-```powershell
-docker compose ps
-```
-
-Rejouer le SQL si la base existe deja :
-
-```powershell
-docker compose exec postgres psql -U fx_user -d fx_rates -f /docker-entrypoint-initdb.d/init_db.sql
-```
-
 Verifier les tables :
 
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "\dt"
 ```
 
-## Tables a verifier
+Relancer seulement Airflow apres modification du `.env` :
 
-Les tables attendues sont :
-- `fx_raw_ingestion`
-- `fx_rates`
-- `fx_rejections`
-- `fx_alerts`
-- `fx_run_logs`
+```powershell
+docker compose build --no-cache airflow
+docker compose up -d --force-recreate airflow
+```
 
 ## Cas 1 - Execution nominale
 
 ### But
 
-Verifier que le pipeline :
-- extrait les taux ;
-- stocke la reponse brute ;
-- transforme les lignes ;
-- charge `fx_rates` ;
-- ecrit un log d'execution ;
-- execute le chemin nominal.
+Prouver que les lignes valides :
+- sont extraites ;
+- sont stockees en brut ;
+- sont transformees ;
+- sont chargees dans `fx_rates` ;
+- sont tracees dans `fx_run_logs`.
 
-### Conditions
+### Configuration
 
-- API Frankfurter disponible
-- devises configurees valides
-- seuil de fraicheur non bloquant
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=
+```
 
-### Action
+### Resultat attendu
 
-Depuis l'UI Airflow :
-1. ouvrir le DAG `fx_rates_pipeline`
-2. lancer une execution manuelle
+- chemin nominal Airflow en succes ;
+- insertion dans `fx_raw_ingestion` ;
+- insertion dans `fx_rates` ;
+- log de succes dans `fx_run_logs` ;
+- pas de rejet pour ce run.
 
-### Visuel Airflow attendu
-
-- `extract_fx_rates` en succes
-- `store_raw_response` en succes
-- `transform_fx_rates` en succes
-- `quality_check_fx_rates` en succes
-- `branch_on_quality` en succes
-- `load_fx_rates` en succes
-- `detect_fx_alerts` en succes
-- `log_fx_success_run` en succes
-
-Chemin rejets attendu :
-- `load_fx_rejections` en skipped si aucune ligne invalide
-- `fail_on_quality_rejections` en skipped
-- `log_fx_rejection_run` en skipped
-
-### Requetes PostgreSQL a lancer
-
-Verifier la table brute :
+### Requetes PostgreSQL
 
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT id, run_id, base_currency, symbols_requested, api_date, ingested_at FROM fx_raw_ingestion ORDER BY ingested_at DESC LIMIT 10;"
 ```
 
-Verifier la table structuree :
-
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT rate_date, base_currency, quote_currency, currency_pair, exchange_rate FROM fx_rates ORDER BY rate_date DESC, currency_pair LIMIT 20;"
 ```
 
-Verifier la table de logs :
-
 ```powershell
-docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, status, rows_received, rows_valid, rows_rejected, rows_inserted, alert_count, created_at FROM fx_run_logs ORDER BY created_at DESC LIMIT 10;"
+docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, status, rows_received, rows_valid, rows_rejected, rows_inserted, created_at FROM fx_run_logs ORDER BY created_at DESC LIMIT 10;"
 ```
 
-### Captures a conserver
-
-- graphe Airflow execution nominale
-- `SELECT` sur `fx_raw_ingestion`
-- `SELECT` sur `fx_rates`
-- `SELECT` sur `fx_run_logs`
-
-## Cas 2 - Lignes rejetees / chemin d'echec
+## Cas 2 - Qualite : completude
 
 ### But
 
-Verifier que des lignes invalides :
-- sont envoyees dans `fx_rejections`
-- ne sont pas chargees dans `fx_rates`
-- provoquent un chemin d'echec trace
+Prouver qu'une devise attendue mais absente de la reponse est rejetee et tracee.
 
-### Simulation du cas
-
-Pour simuler ce cas, plusieurs approches sont possibles.
-
-#### Option 1 - Fraicheur trop stricte
-
-Modifier temporairement dans `.env` :
-
-```env
-FX_FRESHNESS_THRESHOLD_DAYS=0
-```
-
-Si la date retournee par l'API n'est pas exactement consideree comme fraiche selon l'implementation, des lignes peuvent etre rejetees.
-
-#### Option 2 - Devise cible absente
-
-Mettre dans `.env` une devise cible que Frankfurter ne retournera pas correctement dans ce contexte, par exemple une devise invalide ou non attendue selon votre logique de validation.
-
-Exemple :
+### Configuration
 
 ```env
 FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD,XXX
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=
 ```
 
-Cela permet de provoquer un rejet pour devise manquante ou structure invalide.
+### Resultat attendu
 
-#### Option 3 - Simulation explicite d'un taux invalide
+- branchement vers le chemin de rejet ;
+- insertion dans `fx_rejections` ;
+- motif : `Devise cible manquante dans la reponse API` ;
+- log d'execution dans `fx_run_logs`.
 
-Modifier temporairement dans `.env` :
-
-```env
-FX_FORCE_INVALID_RATE_FOR=USD
-```
-
-Effet attendu :
-- la devise `USD` est transformee avec un taux `0` pour le test ;
-- la ligne est rejetee avec le motif `Taux negatif ou nul`.
-
-#### Option 4 - Simulation explicite d'un code devise invalide
-
-Modifier temporairement dans `.env` :
-
-```env
-FX_FORCE_INVALID_CODE_FOR=USD
-```
-
-Effet attendu :
-- la devise `USD` est transformee avec un code invalide `XX` pour le test ;
-- la ligne est rejetee avec le motif `Code devise invalide`.
-
-### Action
-
-1. configurer une situation provoquant au moins un rejet
-2. redemarrer les services si le `.env` a change
-2. lancer le DAG
-
-Commande si changement de `.env` :
+### Requetes PostgreSQL
 
 ```powershell
-docker compose down
-docker compose up -d
+docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, currency_pair, rejection_reason, rejected_at FROM fx_rejections ORDER BY rejected_at DESC LIMIT 10;"
 ```
-
-### Visuel Airflow attendu
-
-- `quality_check_fx_rates` en succes
-- `branch_on_quality` en succes
-- `load_fx_rejections` en succes
-- `log_fx_rejection_run` en succes
-- `fail_on_quality_rejections` en failed
-
-Chemin nominal attendu :
-- `load_fx_rates` skipped ou partiel selon le design retenu
-- `log_fx_success_run` non execute si run en echec
-
-### Requetes PostgreSQL a lancer
-
-Verifier les rejets :
 
 ```powershell
-docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, rate_date, currency_pair, raw_rate, rejection_reason, rejected_at FROM fx_rejections ORDER BY rejected_at DESC LIMIT 20;"
+docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, status, rows_received, rows_valid, rows_rejected, rows_inserted, message, created_at FROM fx_run_logs ORDER BY created_at DESC LIMIT 10;"
 ```
 
-Verifier les logs :
-
-```powershell
-docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, status, rows_received, rows_valid, rows_rejected, rows_inserted, message, created_at FROM fx_run_logs ORDER BY created_at DESC LIMIT 20;"
-```
-
-### Captures a conserver
-
-- graphe Airflow du chemin d'echec
-- `SELECT` sur `fx_rejections`
-- `SELECT` sur `fx_run_logs`
-
-### Retour a l'etat nominal
-
-Remettre la configuration normale dans `.env`, puis :
-
-```powershell
-docker compose down
-docker compose up -d
-```
-
-## Cas 3 - Idempotence / relance sans doublon
+## Cas 3 - Qualite : coherence
 
 ### But
 
-Verifier qu'une relance du DAG ne cree pas de doublons dans `fx_rates`.
+Prouver qu'un taux invalide est rejete et trace.
+
+### Configuration
+
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FX_FORCE_INVALID_RATE_FOR=USD
+FX_FORCE_INVALID_CODE_FOR=
+```
+
+### Resultat attendu
+
+- insertion dans `fx_rejections` ;
+- motif : `Taux negatif ou nul` ;
+- log d'execution dans `fx_run_logs`.
+
+## Cas 4 - Qualite : structure
+
+### But
+
+Prouver qu'un code devise invalide est rejete et trace.
+
+### Configuration
+
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=USD
+```
+
+### Resultat attendu
+
+- insertion dans `fx_rejections` ;
+- motif : `Code devise invalide` ;
+- log d'execution dans `fx_run_logs`.
+
+## Cas 5 - Qualite : fraicheur
+
+### But
+
+Prouver qu'une donnee trop ancienne est rejetee et tracee.
+
+### Configuration
+
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+FX_FRESHNESS_THRESHOLD_DAYS=-1
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=
+```
+
+### Resultat attendu
+
+- insertion dans `fx_rejections` ;
+- motif : `Donnee trop ancienne selon le seuil de fraicheur` ;
+- log d'execution dans `fx_run_logs`.
+
+## Cas 6 - Idempotence / unicite
+
+### But
+
+Prouver qu'une relance avec la meme configuration ne cree pas de doublons metier.
+
+### Configuration
+
+Revenir a la configuration nominale :
+
+```env
+FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
+FX_FRESHNESS_THRESHOLD_DAYS=2
+FX_FORCE_INVALID_RATE_FOR=
+FX_FORCE_INVALID_CODE_FOR=
+```
 
 ### Action
 
 1. lancer une execution nominale
-2. noter le nombre de lignes dans `fx_rates`
-3. relancer le DAG avec les memes parametres
-4. comparer les resultats
+2. relancer une seconde execution avec la meme configuration
 
-### Simulation du cas
+### Resultat attendu
 
-Ce cas ne demande pas de truquage particulier.
+- aucune ligne en doublon logique dans `fx_rates`
+- le pipeline reste relancable sans incoherence
 
-Il faut simplement :
-- garder exactement la meme configuration ;
-- relancer une seconde fois le DAG ;
-- verifier que `ON CONFLICT` evite les doublons logiques.
-
-### Requetes PostgreSQL a lancer
-
-Compter les lignes :
+### Requetes PostgreSQL
 
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT COUNT(*) AS total_rows FROM fx_rates;"
 ```
 
-Verifier l'absence de doublons logiques :
-
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT rate_date, base_currency, quote_currency, COUNT(*) FROM fx_rates GROUP BY rate_date, base_currency, quote_currency HAVING COUNT(*) > 1;"
 ```
 
-### Resultat attendu
+## Requete de synthese qualite
 
-- le comptage reste stable si les memes donnees sont rechargees
-- la requete anti-doublons ne retourne aucune ligne
-
-### Captures a conserver
-
-- premier comptage
-- second comptage
-- requete anti-doublons vide
-
-## Cas 4 - Alertes sur variation
-
-### But
-
-Verifier que des ecarts importants entre deux executions successives produisent des alertes.
-
-### Simulation du cas
-
-Ce cas peut etre difficile a produire naturellement si les variations de taux sont faibles.
-
-Approches possibles :
-
-#### Option 1 - Baisser temporairement le seuil d'alerte
-
-Modifier `.env` :
-
-```env
-FX_ALERT_THRESHOLD=0.0001
-```
-
-Cela rend la detection d'alertes beaucoup plus sensible.
-
-Ensuite :
-
-```powershell
-docker compose down
-docker compose up -d
-```
-
-Puis relancer le DAG.
-
-#### Option 2 - Rejouer a des dates differentes
-
-Si le pipeline charge des donnees avec des dates successives ou des ecarts de taux reels, relancer le DAG a deux moments differents peut suffire.
-
-#### Option 3 - Simulation explicite a ajouter si besoin
-
-Si le cas reste trop difficile a obtenir, vous pouvez ajouter une variable de simulation du type :
-
-```env
-FX_FORCE_ALERT_MULTIPLIER=1.2
-```
-
-Puis modifier temporairement le taux d'une devise pendant le calcul d'alertes pour provoquer un ecart artificiel.
-
-### Requete PostgreSQL a lancer
-
-```powershell
-docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT run_id, rate_date, currency_pair, previous_rate, current_rate, rate_delta, threshold_used, alert_created_at FROM fx_alerts ORDER BY alert_created_at DESC LIMIT 20;"
-```
-
-### Captures a conserver
-
-- `SELECT` sur `fx_alerts`
-- justification du seuil retenu dans le README ou la note
-
-### Retour a l'etat nominal
-
-Revenir au seuil normal dans `.env`, par exemple :
-
-```env
-FX_ALERT_THRESHOLD=0.05
-```
-
-Puis relancer :
-
-```powershell
-docker compose down
-docker compose up -d
-```
-
-## Cas 5 - Logs Airflow
-
-### But
-
-Prouver que le pipeline produit des logs exploitables.
-
-### Requetes utiles
-
-Logs du conteneur :
-
-```powershell
-docker compose logs airflow
-```
-
-Ou lecture via interface Airflow sur chaque tache.
-
-### Elements a retrouver
-
-- extraction des taux
-- stockage brut
-- transformation
-- controle qualite
-- chargement
-- branchement
-- alertes
-- journalisation du run
-
-### Captures a conserver
-
-- une capture du dossier de logs ou de l'onglet `Logs`
-- plusieurs captures montrant des messages applicatifs utiles
-
-## Cas 6 - Detail des tests de qualite
-
-### But
-
-Prouver explicitement les dimensions qualite demandees par le sujet :
-- completude ;
-- structure ;
-- coherence ;
-- fraicheur ;
-- unicite.
-
-### Test 6.1 - Completude
-
-Modifier temporairement `.env` :
-
-```env
-FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD,XXX
-```
-
-Resultat attendu :
-- au moins une ligne dans `fx_rejections` ;
-- motif `Devise cible manquante dans la reponse API` ;
-- run journalise comme execution avec rejets.
-
-### Test 6.2 - Structure
-
-Modifier temporairement `.env` :
-
-```env
-FX_FORCE_INVALID_CODE_FOR=USD
-```
-
-Resultat attendu :
-- au moins une ligne dans `fx_rejections` ;
-- motif `Code devise invalide`.
-
-### Test 6.3 - Coherence
-
-Modifier temporairement `.env` :
-
-```env
-FX_FORCE_INVALID_RATE_FOR=USD
-```
-
-Resultat attendu :
-- au moins une ligne dans `fx_rejections` ;
-- motif `Taux negatif ou nul`.
-
-### Test 6.4 - Fraicheur
-
-Modifier temporairement `.env` :
-
-```env
-FX_FRESHNESS_THRESHOLD_DAYS=-1
-```
-
-Resultat attendu :
-- toutes ou presque toutes les lignes vont en rejet ;
-- motif `Donnee trop ancienne selon le seuil de fraicheur`.
-
-### Test 6.5 - Unicite
-
-Garder la configuration nominale puis relancer le DAG deux fois.
-
-Resultat attendu :
-- aucune ligne retournee par la requete anti-doublon ;
-- pas de duplication logique dans `fx_rates`.
-
-### Requete de synthese des motifs de rejet
+Cette requete permet de resumer les motifs de rejet obtenus pendant les tests :
 
 ```powershell
 docker compose exec postgres psql -U fx_user -d fx_rates -c "SELECT rejection_reason, COUNT(*) FROM fx_rejections GROUP BY rejection_reason ORDER BY COUNT(*) DESC;"
 ```
 
-### Retour a l'etat nominal
+## Ordre recommande
 
-Remettre ensuite dans `.env` :
+1. verifier les tables avec `\dt`
+2. executer le cas nominal
+3. executer le test de completude
+4. executer le test de coherence
+5. executer le test de structure
+6. executer le test de fraicheur
+7. revenir a la configuration nominale
+8. executer le test d'idempotence
 
-```env
-FX_FORCE_INVALID_RATE_FOR=
-FX_FORCE_INVALID_CODE_FOR=
-FX_FRESHNESS_THRESHOLD_DAYS=2
-FRANKFURTER_TARGET_CURRENCIES=USD,GBP,JPY,CHF,CAD
-```
+## Preuves a conserver
 
-Puis relancer :
-
-```powershell
-docker compose down
-docker compose up -d
-```
-
-## Cas 7 - KPIs Metabase
-
-### But
-
-Prouver que les donnees chargees sont exploitables.
-
-### KPI minimum recommandes
-
-1. evolution des taux par paire
-2. nombre d'alertes par jour ou par paire
-
-### Captures a conserver
-
-- un KPI sur `fx_rates`
-- un KPI sur `fx_alerts`
-
-## Ordre recommande des tests
-
-1. verifier `\dt`
-2. tester le cas nominal
-3. tester l'idempotence
-4. tester les controles qualite un par un
-5. tester le chemin d'echec
-6. tester les alertes
-7. recuperer les logs
-8. recuperer les captures Metabase
-
-## Resultat final attendu
-
-A la fin des tests, on doit pouvoir fournir :
-- une execution nominale prouvee
-- un chemin d'echec prouve
-- une relance sans doublon prouvee
-- une table d'alertes exploitable
-- une table de logs exploitable
-- des KPI Metabase visibles
+- capture Airflow du cas nominal
+- capture Airflow du chemin de rejet
+- `SELECT` sur `fx_raw_ingestion`
+- `SELECT` sur `fx_rates`
+- `SELECT` sur `fx_rejections`
+- `SELECT` sur `fx_run_logs`
+- requete anti-doublon vide
